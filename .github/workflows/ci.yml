@@ -12,6 +12,8 @@ on:
   pull_request:
     branches:
       - '**'
+  release:
+      types: [published]
 
 jobs:
   build:
@@ -41,7 +43,7 @@ jobs:
 
   publish-to-pypi:
     name: 🐍 Publish Python distribution to PyPI
-    if: startsWith(github.ref, 'refs/tags/')  # only publish to PyPI on tag pushes
+    if: github.event_name == 'release' && github.event.release.prerelease == false
     needs:
       - build
     runs-on: ubuntu-latest
