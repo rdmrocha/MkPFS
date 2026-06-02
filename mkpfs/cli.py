@@ -437,8 +437,8 @@ def run_image_check(
                 )
 
             compressed_count = sum(1 for i in file_inodes.values() if inodes[i].is_compressed)
-            total_logical = sum(max(0, inodes[i].size) for i in file_inodes.values())
-            total_stored = sum(max(0, inodes[i].size_compressed) for i in file_inodes.values())
+            total_logical = sum(max(0, inodes[i].logical_size) for i in file_inodes.values())
+            total_stored = sum(max(0, inodes[i].stored_size) for i in file_inodes.values())
 
             if emit_report:
                 payload_magic: str = describe_magic(magic=consts.PFSC_MAGIC) if compressed_count > 0 else "none"
@@ -1138,7 +1138,10 @@ def cli_mkpfs_main_parsers() -> argparse.ArgumentParser:
         source_help="Single source file to pack",
         include_require_game_files=False,
     )
-    file_parser.set_defaults(func=cli_mkpfs_pack_file_run)
+    file_parser.set_defaults(
+        inode_bits=32,
+        func=cli_mkpfs_pack_file_run,
+    )
 
     check_parser = sub.add_parser("verify", help="Validate image structure and payload checksums")
     check_parser.add_argument("image_file", help="Path to input .ffpfs image")
