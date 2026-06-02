@@ -537,7 +537,7 @@ def cli_mkpfs_add_create_args(
         "--temp-folder",
         help="Directory for temporary pack artifacts (defaults to the system temp folder)",
     )
-    parser.add_argument("--version", choices=["PS4", "PS5"], default="PS5", help="PFS profile version (default: PS5)")
+    parser.add_argument("--version", choices=["PS4", "PS5"], default="PS4", help="PFS profile version (default: PS4)")
     parser.add_argument(
         "--inode-bits", type=int, choices=[32, 64], default=32, help="Inode width mode bit (32 or 64, default: 32)"
     )

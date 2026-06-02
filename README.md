@@ -191,7 +191,7 @@ python -m mkpfs pack folder c:\game_folder d:\game.ffpfs `
 | `--no-compress` | Disable PFSC block compression. |
 | `--threshold-gain THRESHOLD_GAIN` | Minimum per-block gain percent required to keep PFSC-compressed blocks. Default: `0`. |
 | `--block-size BLOCK_SIZE` | PFS block size in bytes, `auto`, or `auto-fit`. Default: `auto`, which resolves to `65536`; `auto-fit` picks 4096..65536 by estimated file-data padding. |
-| `--version {PS4,PS5}` | PFS profile version. Default: `PS5`. |
+| `--version {PS4,PS5}` | PFS profile version. Default: `PS4`. |
 | `--inode-bits {32,64}` | Inode width mode bit. Default: `32`. (NOTE: 64 bits migth be unstable) |
 | `--case-sensitive` | Build a case-sensitive image. |
 | `--case-insensitive` | Set the case-insensitive mode bit. This is the default behavior. |
@@ -249,7 +249,7 @@ mkpfs pack file ./payload.exfat ./payload.ffpfsc --temp-folder ./tmp/mkpfs
 | `--no-compress` | Disable PFSC block compression. |
 | `--threshold-gain THRESHOLD_GAIN` | Minimum per-block gain percent required to keep PFSC-compressed blocks. Default: `0`. |
 | `--block-size BLOCK_SIZE` | PFS block size in bytes, `auto`, or `auto-fit`. Default: `auto`, which resolves to `65536`; `auto-fit` picks 4096..65536 by estimated file-data padding. |
-| `--version {PS4,PS5}` | PFS profile version. Default: `PS5`. |
+| `--version {PS4,PS5}` | PFS profile version. Default: `PS4`. |
 | `--inode-bits {32,64}` | Inode width mode bit. Default: `32`. |
 | `--case-sensitive` | Build a case-sensitive image. |
 | `--case-insensitive` | Set the case-insensitive mode bit. This is the default behavior. |

@@ -62,7 +62,7 @@ class CliTestCase(unittest.TestCase):
             no_compress=False,
             threshold_gain=20,
             block_size="auto",
-            version="PS5",
+            version="PS4",
             inode_bits=32,
             case_sensitive=False,
             case_insensitive=True,
@@ -91,7 +91,7 @@ class CliTestCase(unittest.TestCase):
             no_compress=False,
             threshold_gain=20,
             block_size="auto",
-            version="PS5",
+            version="PS4",
             inode_bits=32,
             case_sensitive=False,
             case_insensitive=True,
@@ -213,8 +213,8 @@ class TestCliArgumentHelpers(CliTestCase):
         )
         self.assertEqual(inode_bits_action.default, 32)
 
-    def test_pack_parser_uses_ps5_as_default_version(self) -> None:
-        """The pack parser should expose PS5 as the default pack profile version."""
+    def test_pack_parser_uses_ps4_as_default_version(self) -> None:
+        """The pack parser should expose PS4 as the default pack profile version."""
         parser: argparse.ArgumentParser = cli.cli_mkpfs_main_parsers()
         pack_parser: argparse.ArgumentParser = next(
             action.choices["pack"] for action in parser._actions if isinstance(action, argparse._SubParsersAction)
@@ -226,7 +226,7 @@ class TestCliArgumentHelpers(CliTestCase):
         version_action: argparse.Action = next(
             action for action in folder_parser._actions if getattr(action, "dest", "") == "version"
         )
-        self.assertEqual(version_action.default, "PS5")
+        self.assertEqual(version_action.default, "PS4")
 
     def test_pack_parser_exposes_executable_compression_skip_flag(self) -> None:
         """The pack parser should default to skipping executable compression."""
