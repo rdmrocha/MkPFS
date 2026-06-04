@@ -24,6 +24,7 @@ from .pfs import (
     PFSImageInspection,
     build_expected_fpt,
     build_pfs,
+    build_pfs_stream_single_file,
     build_tree_from_uroot,
     choose_auto_fit_block_size,
     compose_pfs_mode_with_sign,
@@ -861,6 +862,103 @@ def cli_mkpfs_create_run(args: argparse.Namespace) -> int:
     )
 
 
+def _run_stream_pack_file(*, args: argparse.Namespace, source_file: Path) -> int:
+    """Pack a single file with the spool-free streaming builder.
+
+    Args:
+        args: Parsed CLI arguments for the file pack workflow.
+        source_file: Resolved source file path.
+
+    Returns:
+        Process exit code for the streaming file packing workflow.
+
+    Raises:
+        BuildError: If CLI parameters are invalid.
+    """
+    output_path: Path
+    output_changed: bool
+    output_path, output_changed = normalize_output_path(
+        args.image_file,
+        ".ffpfsc",
+        adjust=bool(getattr(args, "adjust_output_file_extension", True)),
+    )
+    output_path = output_path.expanduser().resolve()
+    if output_changed:
+        info("Single file streaming mode enabled, adjusting output file extension to .ffpfsc")
+
+    # Validate the subset of pack parameters the streaming builder honors.
+    block_size_arg: str = str(args.block_size).strip().lower() if isinstance(args.block_size, str) else ""
+    if block_size_arg in {"auto", ""}:
+        block_size: int = 65536
+    else:
+        try:
+            block_size = int(args.block_size)
+        except (TypeError, ValueError) as exc:
+            raise BuildError("--block-size must be an integer value or 'auto' for --no-spool") from exc
+    if not is_power_of_two(block_size) or block_size < 0x1000 or block_size > 0x200000:
+        raise BuildError("--block-size must be a power of two between 4096 and 2097152")
+    if args.threshold_gain < 0 or args.threshold_gain > 100:
+        raise BuildError("--threshold-gain must be within 0..100")
+    if args.cpu_count < 0:
+        raise BuildError("--cpu-count must be non-negative")
+    if args.compression_level < 0 or args.compression_level > 9:
+        raise BuildError("--compression-level must be within 0..9")
+    if args.max_compressed_ratio is not None and (args.max_compressed_ratio < 0 or args.max_compressed_ratio > 100):
+        raise BuildError("--max-compressed-ratio must be within 0..100")
+    if args.min_compress_size < 0:
+        raise BuildError("--min-compress-size must be non-negative")
+
+    compress: bool = not args.no_compress
+    min_file_gain: int = 100 - int(args.max_compressed_ratio) if args.max_compressed_ratio is not None else 0
+    case_insensitive: bool = args.case_insensitive or not args.case_sensitive
+    pfs_version: int = consts.PFS_VERSION_PS5 if args.version == "PS5" else consts.PFS_VERSION_PS4
+    encrypted: bool = bool(getattr(args, "encrypted", False))
+    new_crypt: bool = bool(getattr(args, "new_crypt", False))
+    ekpfs_key: bytes = parse_ekpfs_key_hex(getattr(args, "ekpfs_key", None))
+    if getattr(args, "ekpfs_key", None) and not encrypted:
+        raise BuildError("--ekpfs-key requires --encrypted")
+
+    if not prompt_overwrite(output_path):
+        info("Operation cancelled.")
+        return 0
+
+    stats: BuildStats = build_pfs_stream_single_file(
+        source_file=source_file,
+        output_path=output_path,
+        block_size=block_size,
+        pfs_version=pfs_version,
+        case_insensitive=case_insensitive,
+        zlib_level=args.compression_level,
+        threshold_gain=args.threshold_gain,
+        min_file_gain=min_file_gain,
+        min_compress_size=args.min_compress_size,
+        cpu_count=args.cpu_count,
+        compress=compress,
+        encrypted=encrypted,
+        new_crypt=new_crypt,
+        ekpfs=ekpfs_key,
+        verbose=args.verbose,
+    )
+    stats.input_path = source_file
+    print_summary(stats)
+    if not args.verify:
+        return 0
+
+    info("Running post-create check...")
+    errors, warnings, _tree, _uroot = run_image_check(
+        output_path,
+        source_file,
+        print_tree=False,
+        ekpfs=ekpfs_key,
+        new_crypt=new_crypt,
+    )
+    for w in warnings:
+        warning(w)
+    for e in errors:
+        error(e)
+    return 1 if errors else 0
+
+
 def cli_mkpfs_pack_file_run(args: argparse.Namespace) -> int:
     """Pack a single file into a PFS image.
 
@@ -874,6 +972,12 @@ def cli_mkpfs_pack_file_run(args: argparse.Namespace) -> int:
     temp_folder: Path = _resolve_pack_temp_folder(args)
     if not source_file.exists() or not source_file.is_file():
         raise BuildError(f"--source-file must be an existing file: {source_file}")
+
+    # Spool-free streaming path (file path only, unsigned images).
+    if getattr(args, "no_spool", False):
+        if args.signed:
+            raise BuildError("--no-spool does not support --signed images")
+        return _run_stream_pack_file(args=args, source_file=source_file)
 
     with _stage_single_file_source_root(source_file=source_file, temp_folder=temp_folder) as staging_root:
         return _run_pack_build(
@@ -1154,6 +1258,12 @@ def cli_mkpfs_main_parsers() -> argparse.ArgumentParser:
         source_arg_name="source_file",
         source_help="Single source file to pack",
         include_require_game_files=False,
+    )
+    file_parser.add_argument(
+        "--no-spool",
+        action="store_true",
+        help="Stream-compress the source file directly into the image with no temp spool "
+        "(file path only; unsigned images, encryption supported)",
     )
     file_parser.set_defaults(
         inode_bits=32,

@@ -1445,3 +1445,64 @@ class TestRunImageCheck(CliTestCase):
         self.assertTrue(any("CRC32 mismatch" in item for item in errors))
         self.assertTrue(any("Manifest SHA256 mismatch" in item for item in errors))
         self.assertTrue(any("orphan inodes" in item for item in errors))
+
+
+class TestCliPackFileNoSpool(CliTestCase):
+    """Tests for the spool-free streaming flag on the file pack path."""
+
+    def test_pack_file_no_spool_creates_image_without_spool(self) -> None:
+        """`pack file --no-spool` writes the image and leaves no spool in the temp folder."""
+        tmp_path: Path = self.make_temp_path()
+        src: Path = tmp_path / "PPSA.exfat"
+        src.write_bytes(b"DATA" * 20000 + b"\x00" * 60000)
+        temp: Path = tmp_path / "temp"
+        temp.mkdir()
+        out: Path = tmp_path / "PPSA.ffpfsc"
+        buffer: StringIO = StringIO()
+        with patch.object(cli, "prompt_overwrite", return_value=True), redirect_stdout(buffer), redirect_stderr(
+            StringIO()
+        ):
+            rc: int = cli_mkpfs_main(
+                [
+                    "pack",
+                    "file",
+                    str(src),
+                    str(out),
+                    "--version",
+                    "PS5",
+                    "--inode-bits",
+                    "32",
+                    "--no-spool",
+                    "--temp-folder",
+                    str(temp),
+                    "--no-adjust-output-file-extension",
+                ]
+            )
+        self.assertEqual(rc, 0)
+        self.assertTrue(out.exists())
+        self.assertEqual(list(temp.glob("mkpfs-*.pfsc")), [])
+
+    def test_pack_file_no_spool_rejects_signed(self) -> None:
+        """Combining --no-spool with --signed is rejected."""
+        tmp_path: Path = self.make_temp_path()
+        src: Path = tmp_path / "x.exfat"
+        src.write_bytes(b"x" * 1000)
+        out: Path = tmp_path / "x.ffpfsc"
+        with self.assertRaises(BuildError):
+            cli_mkpfs_main(
+                [
+                    "pack",
+                    "file",
+                    str(src),
+                    str(out),
+                    "--no-spool",
+                    "--signed",
+                    "--no-adjust-output-file-extension",
+                ]
+            )
+
+    def test_pack_folder_does_not_accept_no_spool(self) -> None:
+        """The --no-spool flag is only available on the file path, not the folder path."""
+        parser: argparse.ArgumentParser = cli.cli_mkpfs_main_parsers()
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["pack", "folder", "src", "out", "--no-spool"])
