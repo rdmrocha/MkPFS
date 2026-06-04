@@ -3117,6 +3117,341 @@ def build_pfs(
     return stats
 
 
+def build_pfs_stream_single_file(
+    *,
+    source_file: Path,
+    output_path: Path,
+    block_size: int,
+    pfs_version: int,
+    case_insensitive: bool,
+    zlib_level: int,
+    threshold_gain: int,
+    min_file_gain: int,
+    min_compress_size: int,
+    cpu_count: int,
+    compress: bool,
+    encrypted: bool = False,
+    new_crypt: bool = False,
+    ekpfs: bytes | None = None,
+    verbose: bool = False,
+) -> BuildStats:
+    """Build an unsigned PFS container from one file, streaming the payload with no spool.
+
+    Writes provisional front metadata, streams the file's PFSC payload directly into
+    its final block region in a single compression pass, then back-patches the file
+    inode and the header total-block count and truncates. Output is byte-identical to
+    the spool path for the same input.
+
+    Args:
+        source_file: Existing single source file to pack.
+        output_path: Final image path.
+        block_size: Filesystem block size in bytes.
+        pfs_version: PFS profile version.
+        case_insensitive: Whether to set the case-insensitive mode bit.
+        zlib_level: zlib compression level.
+        threshold_gain: Minimum per-block gain percent to keep PFSC blocks.
+        min_file_gain: Minimum whole-file gain percent required to store PFSC.
+        min_compress_size: Minimum raw size eligible for PFSC.
+        cpu_count: Requested CPU budget for block-level compression.
+        compress: Whether PFSC compression is enabled.
+        encrypted: Whether to encrypt filesystem blocks.
+        new_crypt: Whether to use the alternate EKPFS derivation.
+        ekpfs: Optional EKPFS key bytes.
+        verbose: Whether to emit a verbose per-file decision line.
+
+    Returns:
+        Build statistics for the completed image.
+
+    Raises:
+        BuildError: If the source is missing or an unexpected FPT collision occurs.
+    """
+    start: float = time.time()
+    progress: Progress = Progress(enabled=True)
+    if not source_file.is_file():
+        raise BuildError(f"source file does not exist: {source_file}")
+    raw_size: int = source_file.stat().st_size
+    now: int = int(time.time())
+    resolved_ekpfs: bytes = resolve_ekpfs_key(ekpfs=ekpfs)
+    seed: bytes = consts.ZERO_PFS_SEED
+
+    # Build the four unsigned inodes (super_root, fpt, uroot, file).
+    super_root_inode = Inode(
+        number=0,
+        mode=consts.INODE_MODE_DIR | consts.INODE_RX_ONLY,
+        nlink=1,
+        flags=consts.INODE_FLAG_INTERNAL | consts.INODE_FLAG_READONLY,
+        size=block_size,
+        size_compressed=block_size,
+        blocks=1,
+        time_sec=now,
+    )
+    fpt_inode = Inode(
+        number=1,
+        mode=consts.INODE_MODE_FILE | consts.INODE_RX_ONLY,
+        nlink=1,
+        flags=consts.INODE_FLAG_INTERNAL | consts.INODE_FLAG_READONLY,
+        size=0,
+        size_compressed=0,
+        blocks=1,
+        time_sec=now,
+    )
+    uroot_inode = Inode(
+        number=2,
+        mode=consts.INODE_MODE_DIR | consts.INODE_RX_ONLY,
+        nlink=3,
+        flags=consts.INODE_FLAG_READONLY,
+        size=block_size,
+        size_compressed=block_size,
+        blocks=1,
+        time_sec=now,
+    )
+    file_inode = Inode(
+        number=3,
+        mode=consts.INODE_MODE_FILE | consts.INODE_RX_ONLY,
+        nlink=1,
+        flags=consts.INODE_FLAG_READONLY,
+        size=0,
+        size_compressed=0,
+        blocks=1,
+        time_sec=now,
+    )
+    inodes: list[Inode] = [super_root_inode, fpt_inode, uroot_inode, file_inode]
+
+    # Synthesize the single-file directory model and the flat path table.
+    file_node = FileNode(
+        rel_path=source_file.name,
+        abs_path=source_file,
+        parent_rel_dir="",
+        name=source_file.name,
+        raw_size=raw_size,
+    )
+    file_node.inode = file_inode
+    uroot_dir = DirNode(rel_dir="", name="", parent_rel_dir=None, children_files=[source_file.name])
+    uroot_dir.inode = uroot_inode
+    inode_by_path: dict[str, Inode] = {"dir:": uroot_inode, f"file:{source_file.name}": file_inode}
+    fpt_blob: bytes
+    has_collision: bool
+    fpt_blob, _collision_blob, has_collision = make_fpt_and_collision_blob(
+        [uroot_dir],
+        [file_node],
+        inode_by_path,
+        case_insensitive=case_insensitive,
+    )
+    if has_collision:
+        raise BuildError("unexpected FPT collision in single-file streaming builder")
+
+    uroot_dirents: list[Dirent] = [
+        Dirent(uroot_inode.number, consts.DIRENT_TYPE_DOT, "."),
+        Dirent(uroot_inode.number, consts.DIRENT_TYPE_DOTDOT, ".."),
+        Dirent(file_inode.number, consts.DIRENT_TYPE_FILE, source_file.name),
+    ]
+    uroot_blob: bytes = b"".join(d.to_bytes() for d in uroot_dirents)
+    super_root_dirents: list[Dirent] = [
+        Dirent(fpt_inode.number, consts.DIRENT_TYPE_FILE, "flat_path_table"),
+        Dirent(uroot_inode.number, consts.DIRENT_TYPE_DIRECTORY, "uroot"),
+    ]
+
+    inode_count: int = len(inodes)
+    inode_size: int = consts.INODE_D32_SIZE
+    inodes_per_block: int = block_size // inode_size
+    inode_block_count: int = ceil_div(inode_count, inodes_per_block)
+
+    # Front layout (unsigned, contiguous). file.db[0] is known without the payload size.
+    ndblock: int = 1 + inode_block_count
+    super_root_inode.db[0] = ndblock
+    ndblock += super_root_inode.blocks
+    fpt_inode.size = len(fpt_blob)
+    fpt_inode.size_compressed = len(fpt_blob)
+    fpt_inode.blocks = max(1, ceil_div(len(fpt_blob), block_size))
+    fpt_inode.db[0] = ndblock
+    for i in range(1, consts.MAX_DIRECT_BLOCKS):
+        fpt_inode.db[i] = -1
+    ndblock += fpt_inode.blocks
+    ndblock += 1  # reserved empty block (no collision resolver)
+    reserved_empty_blocks: set[int] = {ndblock - 1}
+    uroot_inode.blocks = max(1, ceil_div(len(uroot_blob), block_size))
+    uroot_inode.size = uroot_inode.blocks * block_size
+    uroot_inode.size_compressed = uroot_inode.size
+    uroot_inode.db[0] = ndblock
+    for i in range(1, consts.MAX_DIRECT_BLOCKS):
+        uroot_inode.db[i] = -1
+    ndblock += uroot_inode.blocks
+    file_inode.db[0] = ndblock
+    for i in range(1, consts.MAX_DIRECT_BLOCKS):
+        file_inode.db[i] = -1
+    payload_base: int = file_inode.db[0] * block_size
+
+    mode: int = compose_pfs_mode_with_options(
+        inode_bits=32,
+        case_insensitive=case_insensitive,
+        signed=False,
+        encrypted=encrypted,
+    )
+
+    progress.status(f"\nWriting PFS image to {output_path} (streaming, no spool)...")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path: Path = Path(str(output_path) + ".tmp")
+    stored_size: int = raw_size
+    is_compressed: bool = False
+    gain_pct: float = 0.0
+    hypothetical_size: int = 0
+    try:
+        with tmp_path.open("w+b") as out:
+            # Provisional metadata; final_ndblock and the file inode are patched after streaming.
+            out.write(
+                _pack_pfs_header_block(
+                    block_size=block_size,
+                    pfs_version=pfs_version,
+                    mode=mode,
+                    nblock=1,
+                    inode_count=inode_count,
+                    final_ndblock=0,
+                    inode_block_count=inode_block_count,
+                    now=now,
+                    signed=False,
+                    encrypted=encrypted,
+                    seed=seed,
+                )
+            )
+            out.seek(block_size)
+            _write_inode_table(
+                out=out,
+                inodes=inodes,
+                signed=False,
+                signed_inode_bits=32,
+                block_size=block_size,
+                inode_size=inode_size,
+            )
+            out.seek(super_root_inode.db[0] * block_size)
+            for d in super_root_dirents:
+                out.write(d.to_bytes())
+            out.seek(fpt_inode.db[0] * block_size)
+            out.write(fpt_blob)
+            out.seek(uroot_inode.db[0] * block_size)
+            out.write(uroot_blob)
+
+            # Stream the payload directly into its final region (single compression pass).
+            total_units: int = max(raw_size, 1)
+            processed: int = 0
+
+            def report(delta: int) -> None:
+                """Forward block progress to the write phase bar."""
+                nonlocal processed
+                processed += delta
+                progress.step("write", min(processed, total_units), total_units, bytes_processed=processed)
+
+            if compress and raw_size > 0 and raw_size >= min_compress_size:
+                block_workers: int = resolve_block_compression_worker_count(
+                    requested_cpu_count=resolve_compression_worker_count(requested_cpu_count=cpu_count),
+                    file_size=raw_size,
+                )
+                stored_size, is_compressed, gain_pct, hypothetical_size = _encode_pfsc_into_handle(
+                    out=out,
+                    base_offset=payload_base,
+                    source_path=source_file,
+                    threshold_gain=threshold_gain,
+                    min_file_gain=min_file_gain,
+                    zlib_level=zlib_level,
+                    logical_block_size=consts.PFSC_LOGICAL_BLOCK_SIZE,
+                    block_worker_count=block_workers,
+                    progress_callback=report,
+                )
+
+            # Disabled, too small, or not worth compressing: store raw over the same region.
+            if not is_compressed:
+                write_source_to_offset(
+                    out=out,
+                    source_path=source_file,
+                    payload_size=raw_size,
+                    offset=payload_base,
+                )
+                stored_size = raw_size
+
+            # Finalize sizes and back-patch metadata.
+            file_inode.blocks = max(1, ceil_div(stored_size, block_size)) if stored_size > 0 else 1
+            file_inode.size = stored_size
+            file_inode.flags = consts.INODE_FLAG_READONLY | (consts.INODE_FLAG_COMPRESSED if is_compressed else 0)
+            file_inode.size_compressed = raw_size if is_compressed else stored_size
+            final_ndblock: int = file_inode.db[0] + file_inode.blocks
+
+            validate_d32_ranges(inodes, final_ndblock)
+
+            out.seek(0)
+            out.write(
+                _pack_pfs_header_block(
+                    block_size=block_size,
+                    pfs_version=pfs_version,
+                    mode=mode,
+                    nblock=1,
+                    inode_count=inode_count,
+                    final_ndblock=final_ndblock,
+                    inode_block_count=inode_block_count,
+                    now=now,
+                    signed=False,
+                    encrypted=encrypted,
+                    seed=seed,
+                )
+            )
+            out.seek(block_size)
+            _write_inode_table(
+                out=out,
+                inodes=inodes,
+                signed=False,
+                signed_inode_bits=32,
+                block_size=block_size,
+                inode_size=inode_size,
+            )
+            out.truncate(final_ndblock * block_size)
+
+            if encrypted:
+                encrypt_image_filesystem(
+                    out,
+                    block_size=block_size,
+                    total_blocks=final_ndblock,
+                    ekpfs=resolved_ekpfs,
+                    seed=seed,
+                    new_crypt=new_crypt,
+                    skip_block_numbers=reserved_empty_blocks,
+                )
+
+        validate_image_quick(
+            tmp_path,
+            block_size,
+            mode,
+            pfs_version,
+            ekpfs=resolved_ekpfs if encrypted else None,
+            new_crypt=new_crypt,
+        )
+        shutil.move(str(tmp_path), str(output_path))
+        progress.status(f"Successfully wrote {human_readable_size(final_ndblock * block_size)} image")
+    except Exception:
+        # Remove the partial temp image on any failure, then re-raise the original error.
+        if tmp_path.exists():
+            with suppress(FileNotFoundError):
+                tmp_path.unlink()
+        raise
+
+    stats = BuildStats(input_path=source_file, output_path=output_path)
+    stats.total_files = 1
+    stats.uncompressed_total_size = raw_size
+    stats.stored_total_size = stored_size
+    stats.all_compressed_total_size = hypothetical_size
+    stats.compressed_files = 1 if is_compressed else 0
+    stats.uncompressed_files = 0 if is_compressed else 1
+    stats.block_size = block_size
+    stats.block_alignment_waste = (
+        (ceil_div(stored_size, block_size) * block_size - stored_size) if stored_size > 0 else block_size
+    )
+    stats.elapsed_seconds = time.time() - start
+    if verbose:
+        state: str = "compressed" if is_compressed else "raw"
+        info(
+            f"[file] {source_file.name}: raw={raw_size} stored={stored_size} gain={gain_pct:.2f}% mode={state}",
+            icon_name="file",
+        )
+    return stats
+
+
 def validate_image_quick(
     image_path: Path,
     expected_block_size: int,

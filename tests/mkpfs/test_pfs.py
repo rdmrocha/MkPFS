@@ -2259,3 +2259,80 @@ class TestEncodePfscIntoHandle(PfsTestCase):
 
         assert (handle_size, handle_comp) == (spool_size, spool_comp)
         assert buf.getvalue()[4096 : 4096 + spool_size] == spool.read_bytes()[:spool_size]
+
+
+class TestStreamSingleFileBuilder(PfsTestCase):
+    """Tests for the spool-free single-file streaming builder."""
+
+    def test_stream_single_file_byte_identical_to_spool(self) -> None:
+        """Streaming builder output is byte-identical to the spool path for the same input."""
+        tmp_path: Path = self.make_temp_path()
+        src: Path = tmp_path / "PPSA.exfat"
+        src.write_bytes((b"GAMEDATA" * 4096) + b"\x00" * 200_000)
+
+        with patch("mkpfs.pfs.time.time", return_value=1_700_000_000.0):
+            staging: Path = tmp_path / "stage"
+            staging.mkdir()
+            (staging / "PPSA.exfat").write_bytes(src.read_bytes())
+            out_spool: Path = tmp_path / "spool.ffpfsc"
+            build_pfs(
+                source_root=staging,
+                output_path=out_spool,
+                block_size=65536,
+                pfs_version=c.PFS_VERSION_PS5,
+                inode_bits=32,
+                case_insensitive=True,
+                signed=False,
+                compress=True,
+                threshold_gain=0,
+                cpu_count=1,
+                zlib_level=9,
+                dry_run=False,
+                verbose=False,
+                encrypted=False,
+                temp_folder=tmp_path / "t1",
+            )
+
+            out_stream: Path = tmp_path / "stream.ffpfsc"
+            pfs_mod.build_pfs_stream_single_file(
+                source_file=src,
+                output_path=out_stream,
+                block_size=65536,
+                pfs_version=c.PFS_VERSION_PS5,
+                case_insensitive=True,
+                zlib_level=9,
+                threshold_gain=0,
+                min_file_gain=0,
+                min_compress_size=0,
+                cpu_count=1,
+                compress=True,
+                encrypted=False,
+            )
+
+        assert out_stream.read_bytes() == out_spool.read_bytes()
+
+    def test_stream_single_file_round_trip(self) -> None:
+        """A streamed image extracts back to the original file bytes."""
+        tmp_path: Path = self.make_temp_path()
+        src: Path = tmp_path / "blob.exfat"
+        payload: bytes = bytes(range(256)) * 3000 + b"\x00" * 100_000
+        src.write_bytes(payload)
+        out: Path = tmp_path / "blob.ffpfsc"
+        pfs_mod.build_pfs_stream_single_file(
+            source_file=src,
+            output_path=out,
+            block_size=65536,
+            pfs_version=c.PFS_VERSION_PS5,
+            case_insensitive=True,
+            zlib_level=9,
+            threshold_gain=0,
+            min_file_gain=0,
+            min_compress_size=0,
+            cpu_count=1,
+            compress=True,
+            encrypted=False,
+        )
+        dest: Path = tmp_path / "unpacked"
+        result = extract_pfs_image(image=out, output_path=dest)
+        assert not result.errors
+        assert (dest / "blob.exfat").read_bytes() == payload
