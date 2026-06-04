@@ -467,6 +467,10 @@ Errors:                0
 
 ```
 
+> **Note on conversion speed:** Antivirus scanning can reduce conversion speed, especially during the writing phase or when processing many loose files.
+> If you plan to convert many titles in bulk and you trust this software in your environment, you may temporarily disable real-time antivirus protection to speed up the process.
+> If you are unsure, keep antivirus enabled and expect slower conversions.
+
 ## 🛠️ Development
 
 Set up the local environment:
