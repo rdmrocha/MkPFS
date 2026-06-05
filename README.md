@@ -31,13 +31,13 @@ MkPFS is designed to be a clean and practical entry point for PlayStation PFS im
 # Install/Update using pip
 python -m pip install -U "mkpfs"
 
-# Creating Images: Option 1 - .exfat -> .ffpfsc (Compatible with ShadowMountPlus) (Maximum compatibility and best performance!)
+# Creating Images: Option 1: .exfat -> .ffpfsc (Compatible with ShadowMountPlus) (Maximum compatibility)
 python -m mkpfs pack file './BREW1234.exfat' './BREW1234.exfat.ffpfsc'
 
-# Creating Images: Option 2 - .ffpkg -> .ffpfsc (Compatible with ShadowMountPlus)
+# Creating Images: Option 2: .ffpkg -> .ffpfsc (Compatible with ShadowMountPlus)
 python -m mkpfs pack file './BREW1234.ffpkg' './BREW1234.ffpkg.ffpfsc'
 
-# Creating Images: Option 3 - Game folder wrapped twice into .ffpfsc (Compatible with ShadowMountPlus) 
+# Creating Images: Option 3: Game folder wrapped twice into .ffpfsc (Compatible with ShadowMountPlus) 
 python -m mkpfs pack folder --no-compress --no-adjust-output-file-extension './BREW1234-app' './pfs_image.dat'
 python -m mkpfs pack file './pfs_image.dat' './PPSA12345.ffpfsc'
 rm './pfs_image.dat'
