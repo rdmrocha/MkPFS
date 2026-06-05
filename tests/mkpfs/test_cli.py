@@ -1103,11 +1103,13 @@ class TestCliCreateRun(CliTestCase):
 
         with patch.object(cli.os, "link", side_effect=OSError("hard links unavailable")), patch.object(
             Path, "symlink_to", side_effect=OSError("symlinks unavailable")
-        ), cli._stage_single_file_source_root(source_file=source_file, temp_folder=tmp_path) as staging_root:
+        ), patch.object(cli.shutil, "copyfile", wraps=cli.shutil.copyfile) as mocked_copy, cli._stage_single_file_source_root(
+            source_file=source_file, temp_folder=tmp_path
+        ) as staging_root:
             staged_file: Path = staging_root / source_file.name
             self.assertTrue(staged_file.is_file())
             self.assertEqual(staged_file.read_bytes(), source_file.read_bytes())
-            self.assertNotEqual(staged_file.stat().st_ino, source_file.stat().st_ino)
+            mocked_copy.assert_called_once_with(source_file, staged_file)
 
 
 class TestCliReadOnlyCommands(CliTestCase):
