@@ -363,9 +363,9 @@ def run_image_check(
     expected_crc32: int | None = None,
     expected_manifest_sha256: str | None = None,
     emit_report: bool = True,
-    require_game_files: bool = False,
     ekpfs: bytes | None = None,
     new_crypt: bool = False,
+    require_game_files: bool = False,
 ) -> tuple[list[str], list[str], dict[int, list[ParsedDirent]], int]:
     errors: list[str] = []
     warnings: list[str] = []
