@@ -835,7 +835,7 @@ def _stage_single_file_source_root(*, source_file: Path, temp_folder: Path | Non
                 staging_file.symlink_to(target=source_file)
             except OSError:
                 try:
-                    shutil.copy2(source_file, staging_file)
+                    shutil.copyfile(source_file, staging_file)
                 except OSError as exc:
                     raise BuildError("Unable to stage source file, hard link, symlink, and copy all failed") from exc
         yield staging_root
