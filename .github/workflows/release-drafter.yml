@@ -13,4 +13,4 @@ jobs:
     steps:
       - uses: release-drafter/release-drafter@v7
         with:
-          config-name: release-drafter-config.yml # the default, loads '.github/release-drafter.yml'
+          config-name: release-drafter-config.yml # loads '.github/release-drafter-config.yml'
