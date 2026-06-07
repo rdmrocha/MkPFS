@@ -941,6 +941,61 @@ class TestEncryptedImageRoundTrip(PfsTestCase):
         assert recorded_collision_numbers != []
         assert any(number > 2 for number in recorded_collision_numbers)
 
+    def test_collision_resolver_inode_flags_match_signed_mode(self) -> None:
+        """Collision resolver should mirror signed-mode readonly handling of other internal inodes."""
+        tmp_path: Path = self.make_temp_path()
+        src: Path = make_app_with_nested_dirs(tmp_path / "src")
+        original_fpt_hash: Callable[[str, bool], int] = pfs_mod.fpt_hash
+        collision_paths: set[str] = {"/data/levels/level1.bin", "/data/levels/level2.bin"}
+
+        def selective_collision_hash(path: str, case_insensitive: bool = True) -> int:
+            """Force one FPT collision while preserving other path hashes."""
+            if path in collision_paths:
+                return 0x12345678
+            return original_fpt_hash(path, case_insensitive=case_insensitive)
+
+        for signed in (False, True):
+            out: Path = tmp_path / f"collision-flags-{'signed' if signed else 'unsigned'}.ffpfs"
+            with patch.object(pfs_mod, "fpt_hash", side_effect=selective_collision_hash):
+                build_pfs(
+                    source_root=src,
+                    output_path=out,
+                    block_size=65536,
+                    pfs_version=c.PFS_VERSION_PS4,
+                    inode_bits=32,
+                    case_insensitive=True,
+                    signed=signed,
+                    compress=False,
+                    threshold_gain=1,
+                    cpu_count=1,
+                    zlib_level=9,
+                    dry_run=False,
+                    verbose=False,
+                    encrypted=False,
+                )
+
+            with out.open("rb") as fh:
+                hdr: pfs_mod.ParsedHeader = parse_image_header(fh)
+                inodes: list[pfs_mod.ParsedInode] = parse_image_inodes(fh, hdr)
+                super_root_offset: int = (1 + hdr.dinode_block_count) * hdr.block_size
+                super_root_blob: bytes = pfs_mod.read_image_bytes(fh, hdr, super_root_offset, hdr.block_size)
+                super_entries: list[pfs_mod.ParsedDirent]
+                parse_errors: list[str]
+                super_entries, parse_errors = pfs_mod.parse_image_dirents(super_root_blob, strict=True)
+
+            assert parse_errors == []
+            collision_inode_number: int = next(
+                ent.inode_number for ent in super_entries if ent.name == "collision_resolver"
+            )
+            collision_inode: pfs_mod.ParsedInode = inodes[collision_inode_number]
+            assert collision_inode.flags & c.INODE_FLAG_INTERNAL
+            if signed:
+                assert not (collision_inode.flags & c.INODE_FLAG_READONLY)
+                assert collision_inode.flags & c.INODE_FLAG_SIGNED_EXTRA
+            else:
+                assert collision_inode.flags & c.INODE_FLAG_READONLY
+                assert not (collision_inode.flags & c.INODE_FLAG_SIGNED_EXTRA)
+
     def test_pfsc_encode_decode_round_trip(self) -> None:
         """PFSC payload encoding and decoding should preserve logical bytes."""
         raw: bytes = (b"A" * 65536) + (b"B" * 65536) + (b"C" * 1234)

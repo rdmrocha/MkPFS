@@ -2901,7 +2901,7 @@ def build_pfs(
             mode=consts.INODE_MODE_FILE | consts.INODE_RX_ONLY,
             nlink=1,
             flags=consts.INODE_FLAG_INTERNAL
-            | consts.INODE_FLAG_READONLY
+            | (0 if signed else consts.INODE_FLAG_READONLY)
             | (consts.INODE_FLAG_SIGNED_EXTRA if signed else 0),
             size=0,
             size_compressed=0,
