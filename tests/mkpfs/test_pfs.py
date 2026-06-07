@@ -908,7 +908,11 @@ class TestEncryptedImageRoundTrip(PfsTestCase):
         def recording_inode(*args: object, **kwargs: object) -> pfs_mod.Inode:
             """Record the temporary inode number used for collision_resolver creation."""
             inode: pfs_mod.Inode = real_inode_class(*args, **kwargs)
-            if kwargs.get("flags") == (c.INODE_FLAG_INTERNAL | c.INODE_FLAG_READONLY) and kwargs.get("size") == 0:
+            if (
+                kwargs.get("flags") == (c.INODE_FLAG_INTERNAL | c.INODE_FLAG_READONLY)
+                and kwargs.get("size") == 0
+                and kwargs.get("number") != 1
+            ):
                 recorded_collision_numbers.append(inode.number)
             return inode
 
