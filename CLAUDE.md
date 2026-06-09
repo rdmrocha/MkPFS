@@ -132,6 +132,8 @@ help keep the CLI layer predictable and easy to maintain.
 - Follow pylint/ruff style advice where practical: explicit imports, typed signatures, and minimal use of
   runtime-affecting globals.
 - Do not mention you are an AI or attribute the text edits or anything to any AI tool like Claude or OpenClaude.
+- Never include generator or AI attribution lines in public-facing project text such as commit messages, PR titles,
+  PR bodies, PR comments, release notes, changelog entries, or similar artifacts.
 
 ## Agent / Tooling note
 
