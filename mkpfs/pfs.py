@@ -10,10 +10,12 @@ import hashlib
 import hmac
 import json
 import multiprocessing as mp
+import os
 import queue
 import re
 import shutil
 import struct
+import subprocess
 import time
 import uuid
 import zlib
@@ -26,13 +28,41 @@ from typing import BinaryIO, Protocol
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 from . import consts
-from .logging import info
+from .logging import info, warning
 from .pbar import Progress
 from .utils import _read_exact, ceil_div, human_readable_size, read_param_json, resolve_temp_root
 
 PFSC_PROGRESS_REPORT_BYTES: int = consts.PFSC_LOGICAL_BLOCK_SIZE * 16
 PFSC_SINGLE_FILE_PARALLEL_MIN_SIZE: int = 256 * 1024 * 1024
 AUTO_FIT_BLOCK_SIZE_CANDIDATES: tuple[int, ...] = (0x1000, 0x2000, 0x4000, 0x8000, 0x10000)
+_NON_LOCAL_VOLUME_FS_KEYWORDS: tuple[str, ...] = (
+    "afp",
+    "cifs",
+    "davfs",
+    "fuse",
+    "ftp",
+    "gluster",
+    "nfs",
+    "ntfs",
+    "osxfuse",
+    "rclone",
+    "s3fs",
+    "smb",
+    "sshfs",
+    "webdav",
+)
+_NON_LOCAL_VOLUME_SOURCE_PREFIXES: tuple[str, ...] = (
+    "//",
+    "\\\\",
+)
+_NON_LOCAL_VOLUME_SOURCE_KEYWORDS: tuple[str, ...] = (
+    "fuse",
+    "removable",
+    "smb",
+    "usb",
+)
+_PFSC_WORKER_SOURCE_PATH: Path | None = None
+_PFSC_WORKER_SOURCE_HANDLE: BinaryIO | None = None
 
 
 class SupportsIntQueue(Protocol):
@@ -1130,61 +1160,110 @@ def resolve_block_compression_worker_count(*, requested_cpu_count: int, file_siz
     return max(1, requested_cpu_count)
 
 
+def _init_pfsc_block_worker(*, source_path: Path) -> None:
+    """Open and cache the PFSC source file for one worker process.
+
+    Args:
+        source_path: Source file path shared by all block jobs in the worker.
+    """
+    global _PFSC_WORKER_SOURCE_HANDLE, _PFSC_WORKER_SOURCE_PATH
+    if _PFSC_WORKER_SOURCE_HANDLE is not None and source_path == _PFSC_WORKER_SOURCE_PATH:
+        return
+    if _PFSC_WORKER_SOURCE_HANDLE is not None:
+        _PFSC_WORKER_SOURCE_HANDLE.close()
+    _PFSC_WORKER_SOURCE_PATH = source_path
+    _PFSC_WORKER_SOURCE_HANDLE = source_path.open("rb")
+
+
+def _init_pfsc_block_worker_for_pool(source_path: Path) -> None:
+    """Initialize per-process PFSC worker state for a multiprocessing pool.
+
+    Args:
+        source_path: Source file path shared by all block jobs in the pool.
+    """
+    _init_pfsc_block_worker(source_path=source_path)
+
+
+def _read_pfsc_block_from_worker_handle(*, block_offset: int, logical_block_size: int) -> bytes:
+    """Read one logical PFSC block from the cached worker handle.
+
+    Args:
+        block_offset: Byte offset of the logical block inside the source file.
+        logical_block_size: Number of bytes to read for the logical block.
+
+    Returns:
+        Raw bytes read from the source file, without zero padding.
+
+    Raises:
+        RuntimeError: If the worker pool initializer did not prepare the cached handle.
+    """
+    if _PFSC_WORKER_SOURCE_HANDLE is None or _PFSC_WORKER_SOURCE_PATH is None:
+        raise RuntimeError("PFSC block worker handle is not initialized")
+    _PFSC_WORKER_SOURCE_HANDLE.seek(block_offset)
+    return _PFSC_WORKER_SOURCE_HANDLE.read(logical_block_size)
+
+
 def _iter_pfsc_block_worker_args(
     *,
-    abs_path: Path,
     block_count: int,
     logical_block_size: int,
     zlib_level: int,
-) -> Iterator[tuple[Path, int, int, int]]:
-    """Yield block worker arguments for one file in logical block order."""
+) -> Iterator[tuple[int, int, int]]:
+    """Yield block worker arguments for one file in logical block order.
+
+    Args:
+        block_count: Number of logical blocks in the source file.
+        logical_block_size: PFSC logical block size in bytes.
+        zlib_level: Zlib compression level.
+
+    Yields:
+        Tuples ``(block_offset, logical_block_size, zlib_level)`` in block order.
+    """
     block_index: int
     for block_index in range(block_count):
         block_offset: int = block_index * logical_block_size
-        yield abs_path, block_offset, logical_block_size, zlib_level
+        yield block_offset, logical_block_size, zlib_level
 
 
-def _compress_pfsc_block_lengths_worker(args: tuple[Path, int, int, int]) -> tuple[int, int]:
+def _compress_pfsc_block_lengths_worker(args: tuple[int, int, int]) -> tuple[int, int]:
     """Compress one logical block and return raw/compressed lengths.
 
     Args:
-        args: Tuple ``(abs_path, block_offset, logical_block_size, zlib_level)``.
+        args: Tuple ``(block_offset, logical_block_size, zlib_level)``.
 
     Returns:
         Tuple ``(raw_block_length, compressed_block_length)``.
     """
-    abs_path: Path
     block_offset: int
     logical_block_size: int
     zlib_level: int
-    (abs_path, block_offset, logical_block_size, zlib_level) = args
-    raw_chunk: bytes
-    with abs_path.open("rb") as source_file:
-        source_file.seek(block_offset)
-        raw_chunk = source_file.read(logical_block_size)
+    (block_offset, logical_block_size, zlib_level) = args
+    raw_chunk: bytes = _read_pfsc_block_from_worker_handle(
+        block_offset=block_offset,
+        logical_block_size=logical_block_size,
+    )
     padded_chunk: bytes = raw_chunk.ljust(logical_block_size, b"\x00")
     compressed_chunk: bytes = zlib.compress(padded_chunk, level=zlib_level)
     return len(raw_chunk), len(compressed_chunk)
 
 
-def _compress_pfsc_block_payload_worker(args: tuple[Path, int, int, int]) -> tuple[bytes, bytes]:
+def _compress_pfsc_block_payload_worker(args: tuple[int, int, int]) -> tuple[bytes, bytes]:
     """Compress one logical block and return raw/compressed payload bytes.
 
     Args:
-        args: Tuple ``(abs_path, block_offset, logical_block_size, zlib_level)``.
+        args: Tuple ``(block_offset, logical_block_size, zlib_level)``.
 
     Returns:
         Tuple ``(raw_chunk, compressed_chunk)``.
     """
-    abs_path: Path
     block_offset: int
     logical_block_size: int
     zlib_level: int
-    (abs_path, block_offset, logical_block_size, zlib_level) = args
-    raw_chunk: bytes
-    with abs_path.open("rb") as source_file:
-        source_file.seek(block_offset)
-        raw_chunk = source_file.read(logical_block_size)
+    (block_offset, logical_block_size, zlib_level) = args
+    raw_chunk: bytes = _read_pfsc_block_from_worker_handle(
+        block_offset=block_offset,
+        logical_block_size=logical_block_size,
+    )
     padded_chunk: bytes = raw_chunk.ljust(logical_block_size, b"\x00")
     compressed_chunk: bytes = zlib.compress(padded_chunk, level=zlib_level)
     return raw_chunk, compressed_chunk
@@ -1249,13 +1328,16 @@ def _analyze_pfsc_file_storage(
                 if progress_callback is not None:
                     progress_callback(len(chunk))
     else:
-        worker_args_iter: Iterator[tuple[Path, int, int, int]] = _iter_pfsc_block_worker_args(
-            abs_path=abs_path,
+        worker_args_iter: Iterator[tuple[int, int, int]] = _iter_pfsc_block_worker_args(
             block_count=block_count,
             logical_block_size=logical_block_size,
             zlib_level=zlib_level,
         )
-        with mp.Pool(processes=effective_block_workers) as pool:
+        with mp.Pool(
+            processes=effective_block_workers,
+            initializer=_init_pfsc_block_worker_for_pool,
+            initargs=(abs_path,),
+        ) as pool:
             results_iter = pool.imap(_compress_pfsc_block_lengths_worker, worker_args_iter, chunksize=1)
             raw_block_len: int
             compressed_block_len: int
@@ -1356,13 +1438,16 @@ def _encode_pfsc_into_handle(
                 if progress_callback is not None:
                     progress_callback(len(chunk))
     else:
-        worker_args_iter: Iterator[tuple[Path, int, int, int]] = _iter_pfsc_block_worker_args(
-            abs_path=source_path,
+        worker_args_iter: Iterator[tuple[int, int, int]] = _iter_pfsc_block_worker_args(
             block_count=block_count,
             logical_block_size=logical_block_size,
             zlib_level=zlib_level,
         )
-        with mp.Pool(processes=effective_block_workers) as pool:
+        with mp.Pool(
+            processes=effective_block_workers,
+            initializer=_init_pfsc_block_worker_for_pool,
+            initargs=(source_path,),
+        ) as pool:
             results_iter = pool.imap(_compress_pfsc_block_payload_worker, worker_args_iter, chunksize=1)
             raw_chunk: bytes
             compressed_chunk: bytes
@@ -1575,12 +1660,199 @@ def _drain_compression_progress_queue(progress_queue: SupportsIntQueue) -> int:
     return drained_bytes
 
 
+def _resolve_existing_parent_for_path(*, path: Path) -> Path:
+    """Resolve an existing parent directory for a possibly missing path.
+
+    Args:
+        path: Target path whose nearest existing parent should be found.
+
+    Returns:
+        Existing path suitable for mount probing.
+    """
+    probe_path: Path = path if path.exists() else path.parent
+    root_path: Path = (probe_path.anchor and Path(probe_path.anchor)) or Path("/")
+    while not probe_path.exists() and probe_path != root_path:
+        probe_path = probe_path.parent
+    return probe_path if probe_path.exists() else root_path
+
+
+def _parse_mount_output_line(*, raw_line: str) -> tuple[str, str, str] | None:
+    """Parse one mount-table line into source, mount point, and fs type.
+
+    Args:
+        raw_line: Raw mount output line.
+
+    Returns:
+        Tuple ``(source, mount_point, fs_type)`` when parsing succeeds, otherwise ``None``.
+    """
+    line: str = raw_line.strip()
+    if not line:
+        return None
+    match = re.match(r"^(?P<source>.+?) on (?P<mount>.+?) \((?P<options>.+)\)$", line)
+    if match is None:
+        return None
+    options_text: str = match.group("options")
+    fs_type: str = options_text.split(",", maxsplit=1)[0].strip().lower()
+    return match.group("source").strip(), match.group("mount").strip(), fs_type
+
+
+def _load_mount_table() -> list[tuple[str, str, str]]:
+    """Load mount metadata from the local system on a best-effort basis.
+
+    Returns:
+        List of tuples ``(source, mount_point, fs_type)``.
+    """
+    try:
+        result: subprocess.CompletedProcess[str] = subprocess.run(
+            ["mount"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (FileNotFoundError, OSError, subprocess.CalledProcessError):
+        return []
+    mounts: list[tuple[str, str, str]] = []
+    raw_line: str
+    for raw_line in result.stdout.splitlines():
+        parsed: tuple[str, str, str] | None = _parse_mount_output_line(raw_line=raw_line)
+        if parsed is not None:
+            mounts.append(parsed)
+    return mounts
+
+
+def _path_is_relative_to(*, path: Path, other: Path) -> bool:
+    """Return whether ``path`` is inside ``other`` without raising on mismatch.
+
+    Args:
+        path: Candidate child path.
+        other: Candidate parent path.
+
+    Returns:
+        ``True`` when ``path`` is equal to or nested under ``other``.
+    """
+    try:
+        path.relative_to(other)
+    except ValueError:
+        return False
+    return True
+
+
+def _normalize_mount_path(*, mount_point: str) -> Path | None:
+    """Normalize a mount-point string into a comparable path when possible.
+
+    Args:
+        mount_point: Mount-point text reported by the platform.
+
+    Returns:
+        Normalized absolute path, or ``None`` when the mount point is not a filesystem path.
+    """
+    try:
+        mount_path: Path = Path(mount_point)
+    except (TypeError, ValueError):
+        return None
+    if not mount_path.is_absolute():
+        return None
+    try:
+        return mount_path.resolve(strict=False)
+    except OSError:
+        return mount_path
+
+
+def _classify_non_local_mount(*, path: Path, mounts: list[tuple[str, str, str]]) -> str | None:
+    """Return a short reason when a path appears to be on suspicious storage.
+
+    Args:
+        path: Existing path to classify.
+        mounts: Parsed mount table rows.
+
+    Returns:
+        Short reason string, or ``None`` when the path looks local or detection fails.
+    """
+    try:
+        resolved_path: Path = path.resolve(strict=False)
+    except OSError:
+        resolved_path = path
+    selected_mount: tuple[str, str, str] | None = None
+    selected_mount_len: int = -1
+    source: str
+    mount_point: str
+    fs_type: str
+    for source, mount_point, fs_type in mounts:
+        mount_path: Path | None = _normalize_mount_path(mount_point=mount_point)
+        if mount_path is None or not _path_is_relative_to(path=resolved_path, other=mount_path):
+            continue
+        mount_len: int = len(str(mount_path))
+        if mount_len > selected_mount_len:
+            selected_mount = (source, mount_point, fs_type)
+            selected_mount_len = mount_len
+    if selected_mount is None:
+        return None
+    source, _mount_point, fs_type = selected_mount
+    normalized_source: str = source.lower()
+    normalized_fs_type: str = fs_type.lower()
+    if any(keyword in normalized_fs_type for keyword in _NON_LOCAL_VOLUME_FS_KEYWORDS):
+        return f"filesystem type '{fs_type}'"
+    if any(normalized_source.startswith(prefix) for prefix in _NON_LOCAL_VOLUME_SOURCE_PREFIXES):
+        return f"mount source '{source}'"
+    if any(keyword in normalized_source for keyword in _NON_LOCAL_VOLUME_SOURCE_KEYWORDS):
+        return f"mount source '{source}'"
+    with suppress(OSError):
+        stat_info: os.stat_result = resolved_path.stat()
+        parent_info: os.stat_result = resolved_path.parent.stat()
+        if stat_info.st_dev != parent_info.st_dev and normalized_fs_type not in {
+            "apfs",
+            "hfs",
+            "ext4",
+            "xfs",
+            "btrfs",
+            "ntfs",
+        }:
+            return f"filesystem type '{fs_type}'"
+    return None
+
+
+def get_non_local_volume_warning(*, source_root: Path, output_path: Path, temp_root: Path) -> str | None:
+    """Return a warning when source, output, or temp paths look non-local.
+
+    Args:
+        source_root: Source root used for the build.
+        output_path: Requested image output path.
+        temp_root: Resolved temporary root for spool artifacts.
+
+    Returns:
+        Warning string when any path appears removable, network-backed, or FUSE-like.
+        Returns ``None`` when detection is unavailable or no suspicious path is found.
+    """
+    mounts: list[tuple[str, str, str]] = _load_mount_table()
+    if not mounts:
+        return None
+    probe_paths: list[tuple[str, Path]] = [
+        ("source", _resolve_existing_parent_for_path(path=source_root)),
+        ("output", _resolve_existing_parent_for_path(path=output_path.parent)),
+        ("temp", _resolve_existing_parent_for_path(path=temp_root)),
+    ]
+    suspicious_labels: list[str] = []
+    label: str
+    probe_path: Path
+    for label, probe_path in probe_paths:
+        reason: str | None = _classify_non_local_mount(path=probe_path, mounts=mounts)
+        if reason is not None:
+            suspicious_labels.append(f"{label} path looks non-local via {reason}")
+    if not suspicious_labels:
+        return None
+    joined_labels: str = "; ".join(suspicious_labels)
+    return (
+        "PFSC compression may run slowly because a build path looks non-local "
+        f"({joined_labels}). Try --cpu-count 1 or use local SSD paths for source, output, and temp data."
+    )
+
+
 def resolve_compression_worker_count(*, requested_cpu_count: int) -> int:
     """Resolve the effective compression worker count for the current workload.
 
     Args:
         requested_cpu_count: Requested worker count from CLI, where ``0`` means
-            auto-select with ``max(1, cpu_count() - 1)``.
+            auto-select with ``min(8, max(1, cpu_count() - 1))``.
 
     Returns:
         Effective worker count, always at least ``1``.
@@ -1593,7 +1865,7 @@ def resolve_compression_worker_count(*, requested_cpu_count: int) -> int:
 
     resolved_count: int
     if requested_cpu_count == 0:
-        resolved_count = max(1, mp.cpu_count() - 1)
+        resolved_count = min(8, max(1, mp.cpu_count() - 1))
     else:
         resolved_count = requested_cpu_count
 
@@ -2714,6 +2986,14 @@ def build_pfs(
         total_bytes_to_process: int = sum(f.raw_size for f in compression_file_nodes)
         compression_cpu_count: int = resolve_compression_worker_count(requested_cpu_count=cpu_count)
         worker_count: int = compression_cpu_count
+        if worker_count > 1:
+            non_local_warning: str | None = get_non_local_volume_warning(
+                source_root=source_root,
+                output_path=output_path,
+                temp_root=temp_root,
+            )
+            if non_local_warning is not None:
+                warning(non_local_warning, icon_name="warning")
         file_nodes_by_path: dict[Path, FileNode] = {f.abs_path: f for f in compression_file_nodes}
         progress.status(
             f"\nCompressing {len(compression_file_nodes)} files ({human_readable_size(total_bytes_to_process)}) "
@@ -3495,10 +3775,20 @@ def build_pfs_stream_single_file(
             )
         )
     )
+    compression_cpu_count: int = resolve_compression_worker_count(requested_cpu_count=cpu_count)
     block_workers: int = resolve_block_compression_worker_count(
-        requested_cpu_count=resolve_compression_worker_count(requested_cpu_count=cpu_count),
+        requested_cpu_count=compression_cpu_count,
         file_size=raw_size,
     )
+    if should_compress and block_workers > 1:
+        temp_root: Path = resolve_temp_root(temp_folder=None)
+        non_local_warning: str | None = get_non_local_volume_warning(
+            source_root=source_file,
+            output_path=output_path,
+            temp_root=temp_root,
+        )
+        if non_local_warning is not None:
+            warning(non_local_warning, icon_name="warning")
 
     # Dry run: measure the storage decision and report stats without writing.
     if dry_run:

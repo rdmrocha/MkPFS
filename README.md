@@ -204,7 +204,7 @@ mkpfs pack folder ./input ./game.ffpfs --temp-folder ./tmp/mkpfs
 | `--inode-bits {32,64}` | Inode width mode bit. Default: `32`. (NOTE: 64 bits migth be unstable) |
 | `--case-sensitive` | Build a case-sensitive image. |
 | `--case-insensitive` | Set the case-insensitive mode bit. This is the default behavior. |
-| `--cpu-count CPU_COUNT` | Number of CPU cores to use for PFSC compression. `0` means auto `max(1, cpu_count() - 1)`, non-zero uses `max(1, user value)`. |
+| `--cpu-count CPU_COUNT` | Number of CPU cores to use for PFSC compression. `0` means auto `min(8, max(1, cpu_count() - 1))`, non-zero uses `max(1, user value)`. |
 | `--compression-level COMPRESSION_LEVEL` | Zlib compression level from `0` to `9`. Default: `7`. |
 | `--max-compressed-ratio MAX_COMPRESSED_RATIO` | Maximum PFSC size as percent of the raw file size. Use `95` to store files raw unless PFSC is 95% of raw size or smaller. Default: `95`. |
 | `--min-compress-size MIN_COMPRESS_SIZE` | Store files smaller than this many bytes raw without trying PFSC compression. When omitted (or set to `0`), MkPFS uses the resolved `--block-size` value, `65536` for `--block-size auto`, or the selected value for `--block-size auto-fit`. |
@@ -405,7 +405,7 @@ PFS Image Builder - Parameters
   Compression:       enabled
   Game-file checks:   disabled
   Threshold gain:    20%
-  CPU cores:         7 (auto)
+  CPU cores:         7 (auto, capped at 8)
   Zlib level:        7
   Dry run:           no
 ======================================================================

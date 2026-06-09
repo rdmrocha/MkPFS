@@ -1179,7 +1179,10 @@ class TestEncryptedImageRoundTrip(PfsTestCase):
         assert progress_queue.items[-1] <= pfs_mod.PFSC_PROGRESS_REPORT_BYTES
 
     def test_resolve_compression_worker_count_auto_uses_cpu_count(self) -> None:
-        """Auto worker resolution should use ``max(1, cpu_count() - 1)``."""
+        """Auto worker resolution should use ``min(8, max(1, cpu_count() - 1))``."""
+        with patch.object(pfs_mod.mp, "cpu_count", return_value=32):
+            assert pfs_mod.resolve_compression_worker_count(requested_cpu_count=0) == 8
+
         with patch.object(pfs_mod.mp, "cpu_count", return_value=8):
             assert pfs_mod.resolve_compression_worker_count(requested_cpu_count=0) == 7
 
@@ -1264,6 +1267,32 @@ class TestEncryptedImageRoundTrip(PfsTestCase):
 
         assert observed_block_workers
         assert observed_block_workers[0] == 4
+
+    def test_parallel_pfsc_analysis_matches_single_worker_results(self) -> None:
+        """Parallel PFSC analysis should match the single-worker storage decision."""
+        tmp_path: Path = self.make_temp_path()
+        source_path: Path = tmp_path / "source.bin"
+        raw_payload: bytes = (b"A" * c.PFSC_LOGICAL_BLOCK_SIZE) + (b"ABCD" * 2048) + (b"\x00" * 12345)
+        source_path.write_bytes(raw_payload)
+
+        sequential_result: tuple[int, bool, float, int] = pfs_mod._analyze_pfsc_file_storage(
+            abs_path=source_path,
+            threshold_gain=1,
+            min_file_gain=0,
+            zlib_level=7,
+            logical_block_size=c.PFSC_LOGICAL_BLOCK_SIZE,
+            block_worker_count=1,
+        )
+        parallel_result: tuple[int, bool, float, int] = pfs_mod._analyze_pfsc_file_storage(
+            abs_path=source_path,
+            threshold_gain=1,
+            min_file_gain=0,
+            zlib_level=7,
+            logical_block_size=c.PFSC_LOGICAL_BLOCK_SIZE,
+            block_worker_count=2,
+        )
+
+        assert sequential_result == parallel_result
 
     def test_parallel_pfsc_spool_matches_single_worker_output(self) -> None:
         """Parallel PFSC spool encoding should match single-worker output bytes."""
@@ -2638,7 +2667,123 @@ class TestSourceTreeScanning(PfsTestCase):
         assert pfs_mod.choose_auto_fit_block_size(src) == 4096
 
 
-class TestEncodePfscIntoHandle(PfsTestCase):
+class TestNonLocalVolumeWarnings(PfsTestCase):
+    """Tests for non-local volume warning heuristics used by build_pfs."""
+
+    def test_get_non_local_volume_warning_returns_none_when_mount_table_is_unavailable(self) -> None:
+        """Missing mount metadata should skip the warning silently."""
+        tmp_path: Path = self.make_temp_path()
+        source_root: Path = tmp_path / "src"
+        source_root.mkdir()
+        output_path: Path = tmp_path / "out.ffpfs"
+        temp_root: Path = tmp_path / "tmp"
+        temp_root.mkdir()
+
+        with patch.object(pfs_mod, "_load_mount_table", return_value=[]):
+            warning_text: str | None = pfs_mod.get_non_local_volume_warning(
+                source_root=source_root,
+                output_path=output_path,
+                temp_root=temp_root,
+            )
+
+        assert warning_text is None
+
+    def test_get_non_local_volume_warning_reports_suspicious_mount(self) -> None:
+        """Suspicious mount types should produce a guidance warning."""
+        tmp_path: Path = self.make_temp_path()
+        source_root: Path = tmp_path / "src"
+        source_root.mkdir()
+        output_path: Path = tmp_path / "out.ffpfs"
+        temp_root: Path = tmp_path / "tmp"
+        temp_root.mkdir()
+
+        with patch.object(
+            pfs_mod, "_load_mount_table", return_value=[("disk1s1", str(source_root.parent), "apfs")]
+        ), patch.object(pfs_mod, "_classify_non_local_mount", return_value="filesystem type 'nfs'"):
+            warning_text = pfs_mod.get_non_local_volume_warning(
+                source_root=source_root,
+                output_path=output_path,
+                temp_root=temp_root,
+            )
+
+        assert warning_text is not None
+        assert "--cpu-count 1" in warning_text
+        assert "local SSD paths" in warning_text
+
+    def test_build_pfs_emits_non_local_warning_only_for_multi_worker_compression(self) -> None:
+        """Build warnings should be gated on compression with more than one effective worker."""
+        tmp_path: Path = self.make_temp_path()
+        src: Path = tmp_path / "src"
+        src.mkdir()
+        (src / "large.bin").write_bytes(b"A" * (c.PFSC_LOGICAL_BLOCK_SIZE * 2))
+        output_path: Path = tmp_path / "out.ffpfs"
+
+        with patch.object(pfs_mod, "get_non_local_volume_warning", return_value="slow volume"), patch.object(
+            pfs_mod, "warning"
+        ) as mocked_warning:
+            build_pfs(
+                source_root=src,
+                output_path=output_path,
+                block_size=65536,
+                pfs_version=c.PFS_VERSION_PS4,
+                inode_bits=32,
+                case_insensitive=True,
+                signed=False,
+                compress=True,
+                threshold_gain=0,
+                cpu_count=2,
+                zlib_level=1,
+                dry_run=True,
+                verbose=False,
+                encrypted=False,
+            )
+
+        mocked_warning.assert_called_once_with("slow volume", icon_name="warning")
+
+        with patch.object(pfs_mod, "get_non_local_volume_warning", return_value="slow volume"), patch.object(
+            pfs_mod, "warning"
+        ) as mocked_warning_single:
+            build_pfs(
+                source_root=src,
+                output_path=output_path,
+                block_size=65536,
+                pfs_version=c.PFS_VERSION_PS4,
+                inode_bits=32,
+                case_insensitive=True,
+                signed=False,
+                compress=True,
+                threshold_gain=0,
+                cpu_count=1,
+                zlib_level=1,
+                dry_run=True,
+                verbose=False,
+                encrypted=False,
+            )
+
+        mocked_warning_single.assert_not_called()
+
+        with patch.object(pfs_mod, "get_non_local_volume_warning", return_value="slow volume"), patch.object(
+            pfs_mod, "warning"
+        ) as mocked_warning_disabled:
+            build_pfs(
+                source_root=src,
+                output_path=output_path,
+                block_size=65536,
+                pfs_version=c.PFS_VERSION_PS4,
+                inode_bits=32,
+                case_insensitive=True,
+                signed=False,
+                compress=False,
+                threshold_gain=0,
+                cpu_count=2,
+                zlib_level=1,
+                dry_run=True,
+                verbose=False,
+                encrypted=False,
+            )
+
+        mocked_warning_disabled.assert_not_called()
+
     """Tests for the reusable PFSC handle encoder shared with the spool path."""
 
     def test_encode_pfsc_into_handle_matches_spool(self) -> None:
@@ -2668,7 +2813,7 @@ class TestEncodePfscIntoHandle(PfsTestCase):
             min_file_gain=0,
             zlib_level=9,
             logical_block_size=c.PFSC_LOGICAL_BLOCK_SIZE,
-            block_worker_count=1,
+            block_worker_count=2,
         )
 
         assert (handle_size, handle_comp) == (spool_size, spool_comp)
@@ -2914,6 +3059,73 @@ class TestStreamSingleFileBuilder(PfsTestCase):
         result = extract_pfs_image(image=out, output_path=dest)
         assert not result.errors
         self.assertEqual((dest / "eboot.bin").read_bytes(), src.read_bytes())
+
+    def test_stream_single_file_emits_non_local_warning_only_for_multi_worker_compression(self) -> None:
+        """Streaming builder should warn only when compressed block work uses more than one worker."""
+        tmp_path: Path = self.make_temp_path()
+        src: Path = tmp_path / "large.exfat"
+        src.write_bytes(b"A" * (c.PFSC_LOGICAL_BLOCK_SIZE * 4))
+        out: Path = tmp_path / "large.ffpfsc"
+
+        with patch.object(pfs_mod, "PFSC_SINGLE_FILE_PARALLEL_MIN_SIZE", 1), patch.object(
+            pfs_mod, "get_non_local_volume_warning", return_value="slow volume"
+        ), patch.object(pfs_mod, "warning") as mocked_warning:
+            pfs_mod.build_pfs_stream_single_file(
+                source_file=src,
+                output_path=out,
+                block_size=65536,
+                pfs_version=c.PFS_VERSION_PS5,
+                case_insensitive=True,
+                zlib_level=9,
+                threshold_gain=0,
+                min_file_gain=0,
+                min_compress_size=0,
+                cpu_count=2,
+                compress=True,
+                encrypted=False,
+            )
+
+        mocked_warning.assert_called_once_with("slow volume", icon_name="warning")
+
+        with patch.object(pfs_mod, "PFSC_SINGLE_FILE_PARALLEL_MIN_SIZE", 1), patch.object(
+            pfs_mod, "get_non_local_volume_warning", return_value="slow volume"
+        ), patch.object(pfs_mod, "warning") as mocked_warning_single:
+            pfs_mod.build_pfs_stream_single_file(
+                source_file=src,
+                output_path=out,
+                block_size=65536,
+                pfs_version=c.PFS_VERSION_PS5,
+                case_insensitive=True,
+                zlib_level=9,
+                threshold_gain=0,
+                min_file_gain=0,
+                min_compress_size=0,
+                cpu_count=1,
+                compress=True,
+                encrypted=False,
+            )
+
+        mocked_warning_single.assert_not_called()
+
+        with patch.object(pfs_mod, "PFSC_SINGLE_FILE_PARALLEL_MIN_SIZE", 1), patch.object(
+            pfs_mod, "get_non_local_volume_warning", return_value="slow volume"
+        ), patch.object(pfs_mod, "warning") as mocked_warning_disabled:
+            pfs_mod.build_pfs_stream_single_file(
+                source_file=src,
+                output_path=out,
+                block_size=65536,
+                pfs_version=c.PFS_VERSION_PS5,
+                case_insensitive=True,
+                zlib_level=9,
+                threshold_gain=0,
+                min_file_gain=0,
+                min_compress_size=0,
+                cpu_count=2,
+                compress=False,
+                encrypted=False,
+            )
+
+        mocked_warning_disabled.assert_not_called()
 
 
 class TestStreamingDecode(PfsTestCase):
