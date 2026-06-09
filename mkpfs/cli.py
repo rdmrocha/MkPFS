@@ -252,7 +252,7 @@ def print_build_parameters(
     if compress:
         info(f"  Threshold gain:    {threshold_gain}%")
         resolved_cpu_count: int = resolve_compression_worker_count(requested_cpu_count=cpu_count)
-        cpu_label: str = f"{resolved_cpu_count} (auto)" if cpu_count == 0 else str(max(1, cpu_count))
+        cpu_label: str = f"{resolved_cpu_count} (auto, capped at 8)" if cpu_count == 0 else str(max(1, cpu_count))
         info(f"  CPU cores:         {cpu_label}")
         info(f"  Zlib level:        {zlib_level}")
         if max_compressed_ratio is not None:
@@ -756,7 +756,7 @@ def cli_mkpfs_add_create_args(
         default=0,
         help=(
             "Number of CPU cores for PFSC compression "
-            "(0 = auto max(1, cpu_count() - 1), non-zero = max(1, user value))"
+            "(0 = auto min(8, max(1, cpu_count() - 1)), non-zero = max(1, user value))"
         ),
     )
     parser.add_argument(
