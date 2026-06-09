@@ -792,8 +792,6 @@ def resolve_single_file_inner_name(*, source_name: str, rename_inner_image: bool
                 pending_separator = "_"
             elif character in {"_", "-"}:
                 pending_separator = character
-            else:
-                pending_separator = pending_separator
 
         safe_stem = "".join(collapsed_chars)[:15]
         if not safe_stem:
