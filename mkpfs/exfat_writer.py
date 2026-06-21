@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from ._exfat_upcase import UPCASE_CHECKSUM, UPCASE_TABLE
-from .utils import is_ignored_name
+from .utils import default_image_basename, is_ignored_name
 
 BYTES_PER_SECTOR: int = 512
 BYTES_PER_SECTOR_SHIFT: int = 9
@@ -423,14 +423,22 @@ def iter_exfat_image(source_root: Path, cluster_size: int | None = None) -> Iter
     yield from _emit(root)
 
 
-def write_exfat_image(source_root: Path, output_path: Path, cluster_size: int | None = None) -> None:
-    """Write a complete exFAT image to ``output_path``.
+def write_exfat_image(source_root: Path, output_path: Path, cluster_size: int | None = None) -> Path:
+    """Write a complete exFAT image and return the path written.
 
     Args:
         source_root: Directory whose contents become the volume root.
-        output_path: Destination image path.
+        output_path: Destination image path, or an existing directory in which to
+            create ``<titleId>.exfat`` (the title ID comes from
+            ``sce_sys/param.json``, falling back to the source folder name).
         cluster_size: Optional cluster size in bytes (auto-selected when omitted).
+
+    Returns:
+        The path of the written image.
     """
+    if output_path.is_dir():
+        output_path = output_path / f"{default_image_basename(source_root)}.exfat"
     with output_path.open("wb") as out:
         for chunk in iter_exfat_image(source_root, cluster_size=cluster_size):
             out.write(chunk)
+    return output_path

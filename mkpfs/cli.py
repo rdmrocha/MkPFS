@@ -57,8 +57,8 @@ from .pfs import (
 from .utils import (
     is_power_of_two,
     normalize_output_path,
-    read_param_json,
     resolve_temp_root,
+    title_id_from_source,
 )
 
 PROJECT_URL: str = "https://github.com/PSBrew/MkPFS"
@@ -305,21 +305,7 @@ def _detect_title_id_from_source(source_path: Path) -> str | None:
         The trimmed title ID when the tree exposes a valid ``titleId`` or
         ``title_id`` entry, otherwise ``None``.
     """
-    param_json: Path = source_path / "sce_sys" / "param.json"
-    if not param_json.exists():
-        return None
-
-    try:
-        parsed: dict[str, object] = read_param_json(param_json)
-    except ValueError:
-        return None
-
-    title_id_value: object | None = parsed.get("titleId") or parsed.get("title_id")
-    if isinstance(title_id_value, str):
-        title_id: str = title_id_value.strip()
-        if title_id:
-            return title_id
-    return None
+    return title_id_from_source(source_path)
 
 
 def print_summary(stats: BuildStats) -> None:

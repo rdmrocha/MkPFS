@@ -115,5 +115,24 @@ class TestExfatWriterFormat(ExfatWriterTestCase):
             self.assertEqual(exfat.ExfatReader(fh).geometry.cluster_size, 64 * 1024)
 
 
+class TestExfatWriterAutoName(ExfatWriterTestCase):
+    """Writing to a directory names the image from the titleId."""
+
+    def test_writes_titleid_named_image_into_directory(self) -> None:
+        tmp = self.make_temp_path()
+        src = tmp / "game"
+        (src / "sce_sys").mkdir(parents=True)
+        (src / "sce_sys" / "param.json").write_text('{"titleId": "PPSA25872"}', encoding="utf-8")
+        (src / "eboot.bin").write_bytes(b"BOOT" * 100)
+        out_dir = tmp / "out"
+        out_dir.mkdir()
+        written = write_exfat_image(src, out_dir)
+        self.assertEqual(written.name, "PPSA25872.exfat")
+        self.assertTrue(written.is_file())
+        with written.open("rb") as fh:
+            files = {f.rel_path for f in exfat.ExfatReader(fh).iter_files()}
+        self.assertEqual(files, {"eboot.bin", "sce_sys/param.json"})
+
+
 if __name__ == "__main__":
     unittest.main()
