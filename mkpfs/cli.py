@@ -1391,40 +1391,40 @@ def _run_exfat_pack(*, args: argparse.Namespace, source_path: Path) -> int:
     if output_changed:
         info("exFAT wrapping mode enabled, adjusting output file extension to .ffpfsc")
 
-    if args.threshold_gain < 0 or args.threshold_gain > 100:
-        raise BuildError("--threshold-gain must be within 0..100")
-    if args.compression_level < 0 or args.compression_level > 9:
-        raise BuildError("--compression-level must be within 0..9")
-
-    case_insensitive: bool = args.case_insensitive or not args.case_sensitive
-    pfs_version: int = consts.PFS_VERSION_PS5 if args.version == "PS5" else consts.PFS_VERSION_PS4
-    encrypted: bool = bool(getattr(args, "encrypted", False))
-    new_crypt: bool = bool(getattr(args, "new_crypt", False))
-    ekpfs_key: bytes = parse_ekpfs_key_hex(getattr(args, "ekpfs_key", None))
-    if getattr(args, "ekpfs_key", None) and not encrypted:
-        raise BuildError("--ekpfs-key requires --encrypted")
     if args.signed:
         raise BuildError("--exfat wrapping does not support --signed images")
 
-    if not args.dry_run and not prompt_overwrite(output_path):
-        info("Operation cancelled.")
-        return 0
+    config: PackBuildConfig = _resolve_pack_build_config(args, block_size=65536)
+    temp_folder: Path = _resolve_pack_temp_folder(args)
+    _print_pack_parameters(
+        config=config,
+        display_source_path=source_path,
+        output_path=output_path,
+        temp_folder=temp_folder,
+        signed=False,
+        require_game_files=False,
+        dry_run=args.dry_run,
+    )
+
     if args.dry_run:
         info("--dry-run is not supported with --exfat; nothing written.")
+        return 0
+    if not prompt_overwrite(output_path):
+        info("Operation cancelled.")
         return 0
 
     stats: BuildStats = build_pfs_stream_from_exfat(
         source_root=source_path,
         output_path=output_path,
-        block_size=65536,
-        pfs_version=pfs_version,
-        case_insensitive=case_insensitive,
-        zlib_level=args.compression_level,
-        threshold_gain=args.threshold_gain,
-        cpu_count=args.cpu_count,
-        encrypted=encrypted,
-        new_crypt=new_crypt,
-        ekpfs=ekpfs_key,
+        block_size=config.block_size,
+        pfs_version=config.pfs_version,
+        case_insensitive=config.case_insensitive,
+        zlib_level=config.zlib_level,
+        threshold_gain=config.threshold_gain,
+        cpu_count=config.cpu_count,
+        encrypted=config.encrypted,
+        new_crypt=config.new_crypt,
+        ekpfs=config.ekpfs_key,
         verbose=args.verbose,
     )
     stats.input_path = source_path
@@ -1434,7 +1434,7 @@ def _run_exfat_pack(*, args: argparse.Namespace, source_path: Path) -> int:
 
     info("Running post-create check...")
     errors, warnings, _tree, _uroot = run_image_check(
-        output_path, None, print_tree=False, ekpfs=ekpfs_key, new_crypt=new_crypt
+        output_path, None, print_tree=False, ekpfs=config.ekpfs_key, new_crypt=config.new_crypt
     )
     for w in warnings:
         warning(w)
